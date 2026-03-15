@@ -3,11 +3,15 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -338,7 +342,7 @@ func parseSession(path string) (*SessionReport, error) {
 
 // --- Display ---
 
-func printReport(r *SessionReport, sessionNum int) {
+func printReport(r *SessionReport, sessionNum int) error {
 	bashCalls := []ToolCall{}
 	bigOutputCalls := []ToolCall{}
 
@@ -352,7 +356,7 @@ func printReport(r *SessionReport, sessionNum int) {
 	}
 
 	if len(bashCalls) == 0 && len(bigOutputCalls) == 0 {
-		return
+		return nil
 	}
 
 	// Project name from path
@@ -369,31 +373,44 @@ func printReport(r *SessionReport, sessionNum int) {
 		}
 	}
 
-	fmt.Printf("\n=== Session %d: %s / %s (%s) ===\n",
-		sessionNum, project, session, r.ModTime.Format("2006-01-02 15:04"))
+	w := os.Stdout
+	if _, err := fmt.Fprintf(w, "\n=== Session %d: %s / %s (%s) ===\n",
+		sessionNum, project, session, r.ModTime.Format("2006-01-02 15:04")); err != nil {
+		return err
+	}
 
 	if len(bashCalls) > 0 {
-		fmt.Println("\n  Bash commands:")
+		if _, err := fmt.Fprintln(w, "\n  Bash commands:"); err != nil {
+			return err
+		}
 		for _, tc := range bashCalls {
 			perm := ""
 			if tc.NeedsPermission {
 				perm = " [PERMISSION REQUIRED]"
 			}
-			fmt.Printf("    %s$ %s\n", perm, tc.InputSummary)
+			if _, err := fmt.Fprintf(w, "    %s$ %s\n", perm, tc.InputSummary); err != nil {
+				return err
+			}
 		}
 	}
 
 	if len(bigOutputCalls) > 0 {
-		fmt.Println("\n  Large tool outputs / subagents:")
+		if _, err := fmt.Fprintln(w, "\n  Large tool outputs / subagents:"); err != nil {
+			return err
+		}
 		for _, tc := range bigOutputCalls {
+			var err error
 			if tc.IsAgent {
-				fmt.Printf("    Agent(%d tokens): %s\n", tc.AgentTokens, tc.InputSummary)
+				_, err = fmt.Fprintf(w, "    Agent(%d tokens): %s\n", tc.AgentTokens, tc.InputSummary)
 			} else {
-				size := formatBytes(tc.OutputBytes)
-				fmt.Printf("    %s(%s): %s\n", tc.ToolName, size, tc.InputSummary)
+				_, err = fmt.Fprintf(w, "    %s(%s): %s\n", tc.ToolName, formatBytes(tc.OutputBytes), tc.InputSummary)
+			}
+			if err != nil {
+				return err
 			}
 		}
 	}
+	return nil
 }
 
 func formatBytes(n int) string {
@@ -407,6 +424,8 @@ func formatBytes(n int) string {
 }
 
 func main() {
+	signal.Ignore(syscall.SIGPIPE)
+
 	files, err := findSessionFiles()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error reading transcripts: %v\n", err)
@@ -418,21 +437,19 @@ func main() {
 		return
 	}
 
-	// Default: show last 10 sessions
-	limit := 10
-	shown := 0
 	for i, sf := range files {
-		if shown >= limit {
-			break
-		}
 		report, err := parseSession(sf.Path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not parse %s: %v\n", sf.Path, err)
 			continue
 		}
-		printReport(report, i+1)
-		if len(report.ToolCalls) > 0 {
-			shown++
+		err = printReport(report, i+1)
+		if err != nil {
+			if errors.Is(err, io.ErrClosedPipe) || strings.Contains(err.Error(), "broken pipe") {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "write error: %v\n", err)
+			return
 		}
 	}
 }
