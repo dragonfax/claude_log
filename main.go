@@ -195,7 +195,9 @@ func summarizeInput(name string, raw json.RawMessage) string {
 	switch name {
 	case "Bash":
 		if cmd, ok := m["command"].(string); ok {
-			return truncate(cmd, maxSummary)
+			cmd = strings.ReplaceAll(cmd, "\n", " ")
+			cmd = strings.ReplaceAll(cmd, "\t", " ")
+			return cmd
 		}
 	case "Read":
 		if p, ok := m["file_path"].(string); ok {
