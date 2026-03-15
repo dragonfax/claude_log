@@ -1,0 +1,438 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	transcriptDir = "/Users/jstillwell/.claude/projects"
+	maxSummary    = 100
+)
+
+// --- JSON types ---
+
+type Entry struct {
+	Type       string          `json:"type"`
+	UUID       string          `json:"uuid"`
+	ParentUUID string          `json:"parentUuid"`
+	Timestamp  time.Time       `json:"timestamp"`
+	IsSidechain bool           `json:"isSidechain"`
+	Message    *Message        `json:"message"`
+	ToolUseResult *ToolUseResult `json:"toolUseResult"`
+	PermissionMode string      `json:"permissionMode"`
+}
+
+type Message struct {
+	Role    string        `json:"role"`
+	Content MessageContent `json:"content"`
+}
+
+// MessageContent can be a string or []ContentBlock
+type MessageContent struct {
+	Blocks []ContentBlock
+	Text   string
+}
+
+func (m *MessageContent) UnmarshalJSON(data []byte) error {
+	// Try array first
+	var blocks []ContentBlock
+	if err := json.Unmarshal(data, &blocks); err == nil {
+		m.Blocks = blocks
+		return nil
+	}
+	// Try string
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		m.Text = s
+		return nil
+	}
+	return nil
+}
+
+type ContentBlock struct {
+	Type      string          `json:"type"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
+	Text      string          `json:"text"`
+	ToolUseID string          `json:"tool_use_id"`
+	Content   ToolResultContent `json:"content"`
+	IsError   bool            `json:"is_error"`
+}
+
+// ToolResultContent can be string or []ContentBlock
+type ToolResultContent struct {
+	Text   string
+	Blocks []ContentBlock
+}
+
+func (t *ToolResultContent) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		t.Text = s
+		return nil
+	}
+	var blocks []ContentBlock
+	if err := json.Unmarshal(data, &blocks); err == nil {
+		t.Blocks = blocks
+		return nil
+	}
+	return nil
+}
+
+func (t *ToolResultContent) Size() int {
+	if t.Text != "" {
+		return len(t.Text)
+	}
+	total := 0
+	for _, b := range t.Blocks {
+		total += len(b.Text)
+	}
+	return total
+}
+
+type ToolUseResult struct {
+	Stdout        string         `json:"stdout"`
+	Stderr        string         `json:"stderr"`
+	Status        string         `json:"status"`
+	AgentID       string         `json:"agentId"`
+	TotalTokens   int            `json:"totalTokens"`
+	TotalDurationMs int          `json:"totalDurationMs"`
+	TotalToolUseCount int        `json:"totalToolUseCount"`
+	Content       []ContentBlock `json:"content"`
+}
+
+// --- Session file discovery ---
+
+type SessionFile struct {
+	Path    string
+	ModTime time.Time
+}
+
+func findSessionFiles() ([]SessionFile, error) {
+	entries, err := os.ReadDir(transcriptDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var files []SessionFile
+	for _, projectEntry := range entries {
+		if !projectEntry.IsDir() {
+			continue
+		}
+		projectDir := filepath.Join(transcriptDir, projectEntry.Name())
+		projectEntries, err := os.ReadDir(projectDir)
+		if err != nil {
+			continue
+		}
+		for _, f := range projectEntries {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			files = append(files, SessionFile{
+				Path:    filepath.Join(projectDir, f.Name()),
+				ModTime: info.ModTime(),
+			})
+		}
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].ModTime.After(files[j].ModTime)
+	})
+	return files, nil
+}
+
+// --- Parsing ---
+
+type ToolCall struct {
+	ToolName       string
+	InputSummary   string
+	OutputBytes    int
+	NeedsPermission bool // true when the session's permissionMode != "default" at time of call
+	Timestamp      time.Time
+	IsAgent        bool
+	AgentTokens    int
+}
+
+type SessionReport struct {
+	Path       string
+	ModTime    time.Time
+	ProjectDir string
+	ToolCalls  []ToolCall
+}
+
+func summarizeInput(name string, raw json.RawMessage) string {
+	if raw == nil {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return truncate(string(raw), maxSummary)
+	}
+
+	switch name {
+	case "Bash":
+		if cmd, ok := m["command"].(string); ok {
+			return truncate(cmd, maxSummary)
+		}
+	case "Read":
+		if p, ok := m["file_path"].(string); ok {
+			return p
+		}
+	case "Write", "Edit":
+		if p, ok := m["file_path"].(string); ok {
+			return p
+		}
+	case "Grep":
+		pattern, _ := m["pattern"].(string)
+		path, _ := m["path"].(string)
+		if path != "" {
+			return truncate(fmt.Sprintf("%s in %s", pattern, path), maxSummary)
+		}
+		return truncate(pattern, maxSummary)
+	case "Glob":
+		if p, ok := m["pattern"].(string); ok {
+			return p
+		}
+	case "WebFetch":
+		if u, ok := m["url"].(string); ok {
+			return truncate(u, maxSummary)
+		}
+	case "WebSearch":
+		if q, ok := m["query"].(string); ok {
+			return truncate(q, maxSummary)
+		}
+	case "Agent":
+		if d, ok := m["description"].(string); ok {
+			return truncate(d, maxSummary)
+		}
+	}
+
+	// Fallback: compact JSON
+	b, _ := json.Marshal(m)
+	return truncate(string(b), maxSummary)
+}
+
+func truncate(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\t", " ")
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
+}
+
+func parseSession(path string) (*SessionReport, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, _ := f.Stat()
+	report := &SessionReport{
+		Path:    path,
+		ModTime: info.ModTime(),
+	}
+
+	// Maps to correlate tool calls with their results
+	type pendingCall struct {
+		name    string
+		summary string
+		ts      time.Time
+		isAgent bool
+	}
+	pending := map[string]pendingCall{} // tool_use_id -> call info
+	// Track permissionMode from the most recent user message (initial message only)
+	currentPermMode := "default"
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var entry Entry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+
+		// Skip sidechain (subagent) entries — we only care about main context
+		if entry.IsSidechain {
+			continue
+		}
+
+		switch entry.Type {
+		case "user":
+			if entry.Message == nil {
+				continue
+			}
+			// Capture permission mode from initial user messages (no tool results)
+			if entry.PermissionMode != "" {
+				currentPermMode = entry.PermissionMode
+			}
+
+			// Process tool results
+			for _, block := range entry.Message.Content.Blocks {
+				if block.Type != "tool_result" {
+					continue
+				}
+				call, ok := pending[block.ToolUseID]
+				if !ok {
+					continue
+				}
+				delete(pending, block.ToolUseID)
+
+				tc := ToolCall{
+					ToolName:     call.name,
+					InputSummary: call.summary,
+					Timestamp:    call.ts,
+					IsAgent:      call.isAgent,
+					NeedsPermission: currentPermMode != "default",
+				}
+
+				if call.isAgent && entry.ToolUseResult != nil {
+					tc.AgentTokens = entry.ToolUseResult.TotalTokens
+					tc.OutputBytes = entry.ToolUseResult.TotalTokens // use tokens for agents
+				} else {
+					tc.OutputBytes = block.Content.Size()
+				}
+
+				report.ToolCalls = append(report.ToolCalls, tc)
+			}
+
+		case "assistant":
+			if entry.Message == nil {
+				continue
+			}
+			for _, block := range entry.Message.Content.Blocks {
+				if block.Type != "tool_use" {
+					continue
+				}
+				pending[block.ID] = pendingCall{
+					name:    block.Name,
+					summary: summarizeInput(block.Name, block.Input),
+					ts:      entry.Timestamp,
+					isAgent: block.Name == "Agent",
+				}
+			}
+		}
+	}
+
+	return report, scanner.Err()
+}
+
+// --- Display ---
+
+func printReport(r *SessionReport, sessionNum int) {
+	bashCalls := []ToolCall{}
+	bigOutputCalls := []ToolCall{}
+
+	for _, tc := range r.ToolCalls {
+		if tc.ToolName == "Bash" {
+			bashCalls = append(bashCalls, tc)
+		}
+		if tc.IsAgent || tc.OutputBytes > 1000 {
+			bigOutputCalls = append(bigOutputCalls, tc)
+		}
+	}
+
+	if len(bashCalls) == 0 && len(bigOutputCalls) == 0 {
+		return
+	}
+
+	// Project name from path
+	parts := strings.Split(r.Path, string(os.PathSeparator))
+	var project, session string
+	if len(parts) >= 2 {
+		project = parts[len(parts)-2]
+		session = strings.TrimSuffix(parts[len(parts)-1], ".jsonl")
+		if len(project) > 50 {
+			project = "..." + project[len(project)-47:]
+		}
+		if len(session) > 8 {
+			session = session[:8]
+		}
+	}
+
+	fmt.Printf("\n=== Session %d: %s / %s (%s) ===\n",
+		sessionNum, project, session, r.ModTime.Format("2006-01-02 15:04"))
+
+	if len(bashCalls) > 0 {
+		fmt.Println("\n  Bash commands:")
+		for _, tc := range bashCalls {
+			perm := ""
+			if tc.NeedsPermission {
+				perm = " [PERMISSION REQUIRED]"
+			}
+			fmt.Printf("    %s$ %s\n", perm, tc.InputSummary)
+		}
+	}
+
+	if len(bigOutputCalls) > 0 {
+		fmt.Println("\n  Large tool outputs / subagents:")
+		for _, tc := range bigOutputCalls {
+			if tc.IsAgent {
+				fmt.Printf("    Agent(%d tokens): %s\n", tc.AgentTokens, tc.InputSummary)
+			} else {
+				size := formatBytes(tc.OutputBytes)
+				fmt.Printf("    %s(%s): %s\n", tc.ToolName, size, tc.InputSummary)
+			}
+		}
+	}
+}
+
+func formatBytes(n int) string {
+	if n < 1024 {
+		return fmt.Sprintf("%dB", n)
+	}
+	if n < 1024*1024 {
+		return fmt.Sprintf("%.1fKB", float64(n)/1024)
+	}
+	return fmt.Sprintf("%.1fMB", float64(n)/1024/1024)
+}
+
+func main() {
+	files, err := findSessionFiles()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error reading transcripts: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(files) == 0 {
+		fmt.Println("No session transcripts found.")
+		return
+	}
+
+	// Default: show last 10 sessions
+	limit := 10
+	shown := 0
+	for i, sf := range files {
+		if shown >= limit {
+			break
+		}
+		report, err := parseSession(sf.Path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not parse %s: %v\n", sf.Path, err)
+			continue
+		}
+		printReport(report, i+1)
+		if len(report.ToolCalls) > 0 {
+			shown++
+		}
+	}
+}
