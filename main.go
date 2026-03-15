@@ -15,10 +15,16 @@ import (
 	"time"
 )
 
-const (
-	transcriptDir = "/Users/jstillwell/.claude/projects"
-	maxSummary    = 100
-)
+const maxSummary = 100
+
+func transcriptDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error finding home directory: %v\n", err)
+		os.Exit(1)
+	}
+	return filepath.Join(home, ".claude", "projects")
+}
 
 // --- JSON types ---
 
@@ -121,7 +127,8 @@ type SessionFile struct {
 }
 
 func findSessionFiles() ([]SessionFile, error) {
-	entries, err := os.ReadDir(transcriptDir)
+	dir := transcriptDir()
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +138,7 @@ func findSessionFiles() ([]SessionFile, error) {
 		if !projectEntry.IsDir() {
 			continue
 		}
-		projectDir := filepath.Join(transcriptDir, projectEntry.Name())
+		projectDir := filepath.Join(dir, projectEntry.Name())
 		projectEntries, err := os.ReadDir(projectDir)
 		if err != nil {
 			continue
@@ -244,7 +251,10 @@ func parseSession(path string) (*SessionReport, error) {
 	}
 	defer f.Close()
 
-	info, _ := f.Stat()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
 	report := &SessionReport{
 		Path:    path,
 		ModTime: info.ModTime(),
@@ -311,7 +321,7 @@ func parseSession(path string) (*SessionReport, error) {
 
 				if call.isAgent && entry.ToolUseResult != nil {
 					tc.AgentTokens = entry.ToolUseResult.TotalTokens
-					tc.OutputBytes = entry.ToolUseResult.TotalTokens // use tokens for agents
+					// OutputBytes not set for agents; IsAgent flag handles display
 				} else {
 					tc.OutputBytes = block.Content.Size()
 				}
@@ -342,7 +352,7 @@ func parseSession(path string) (*SessionReport, error) {
 
 // --- Display ---
 
-func printReport(r *SessionReport, sessionNum int) error {
+func printReport(r *SessionReport, sessionNum int) (bool, error) {
 	bashCalls := []ToolCall{}
 	bigOutputCalls := []ToolCall{}
 
@@ -356,7 +366,7 @@ func printReport(r *SessionReport, sessionNum int) error {
 	}
 
 	if len(bashCalls) == 0 && len(bigOutputCalls) == 0 {
-		return nil
+		return false, nil
 	}
 
 	// Project name from path
@@ -376,12 +386,12 @@ func printReport(r *SessionReport, sessionNum int) error {
 	w := os.Stdout
 	if _, err := fmt.Fprintf(w, "\n=== Session %d: %s / %s (%s) ===\n",
 		sessionNum, project, session, r.ModTime.Format("2006-01-02 15:04")); err != nil {
-		return err
+		return false, err
 	}
 
 	if len(bashCalls) > 0 {
 		if _, err := fmt.Fprintln(w, "\n  Bash commands:"); err != nil {
-			return err
+			return false, err
 		}
 		for _, tc := range bashCalls {
 			perm := ""
@@ -389,14 +399,14 @@ func printReport(r *SessionReport, sessionNum int) error {
 				perm = " [PERMISSION REQUIRED]"
 			}
 			if _, err := fmt.Fprintf(w, "    %s$ %s\n", perm, tc.InputSummary); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
 
 	if len(bigOutputCalls) > 0 {
 		if _, err := fmt.Fprintln(w, "\n  Large tool outputs / subagents:"); err != nil {
-			return err
+			return false, err
 		}
 		for _, tc := range bigOutputCalls {
 			var err error
@@ -406,11 +416,11 @@ func printReport(r *SessionReport, sessionNum int) error {
 				_, err = fmt.Fprintf(w, "    %s(%s): %s\n", tc.ToolName, formatBytes(tc.OutputBytes), tc.InputSummary)
 			}
 			if err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func formatBytes(n int) string {
@@ -437,13 +447,18 @@ func main() {
 		return
 	}
 
-	for i, sf := range files {
+	displayNum := 0
+	for _, sf := range files {
 		report, err := parseSession(sf.Path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not parse %s: %v\n", sf.Path, err)
 			continue
 		}
-		err = printReport(report, i+1)
+		displayNum++
+		printed, err := printReport(report, displayNum)
+		if !printed {
+			displayNum--
+		}
 		if err != nil {
 			if errors.Is(err, io.ErrClosedPipe) || strings.Contains(err.Error(), "broken pipe") {
 				return
