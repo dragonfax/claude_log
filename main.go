@@ -26,20 +26,30 @@ func transcriptDir() string {
 	return filepath.Join(home, ".claude", "projects")
 }
 
+func permissionsFile() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error finding home directory: %v\n", err)
+		os.Exit(1)
+	}
+	return filepath.Join(home, ".claude", "claude_log", "permissions.jsonl")
+}
+
 // --- JSON types ---
 
 type Entry struct {
-	Type       string          `json:"type"`
-	UUID       string          `json:"uuid"`
-	ParentUUID string          `json:"parentUuid"`
-	Timestamp  time.Time       `json:"timestamp"`
+	Type        string         `json:"type"`
+	UUID        string         `json:"uuid"`
+	ParentUUID  string         `json:"parentUuid"`
+	Timestamp   time.Time      `json:"timestamp"`
 	IsSidechain bool           `json:"isSidechain"`
-	Message    *Message        `json:"message"`
+	SessionID   string         `json:"sessionId"`
+	Message     *Message       `json:"message"`
 	ToolUseResult *ToolUseResult `json:"toolUseResult"`
 }
 
 type Message struct {
-	Role    string        `json:"role"`
+	Role    string       `json:"role"`
 	Content MessageContent `json:"content"`
 }
 
@@ -108,14 +118,14 @@ func (t *ToolResultContent) Size() int {
 }
 
 type ToolUseResult struct {
-	Stdout        string         `json:"stdout"`
-	Stderr        string         `json:"stderr"`
-	Status        string         `json:"status"`
-	AgentID       string         `json:"agentId"`
-	TotalTokens   int            `json:"totalTokens"`
-	TotalDurationMs int          `json:"totalDurationMs"`
-	TotalToolUseCount int        `json:"totalToolUseCount"`
-	Content       []ContentBlock `json:"content"`
+	Stdout          string         `json:"stdout"`
+	Stderr          string         `json:"stderr"`
+	Status          string         `json:"status"`
+	AgentID         string         `json:"agentId"`
+	TotalTokens     int            `json:"totalTokens"`
+	TotalDurationMs int            `json:"totalDurationMs"`
+	TotalToolUseCount int          `json:"totalToolUseCount"`
+	Content         []ContentBlock `json:"content"`
 }
 
 // --- Session file discovery ---
@@ -166,12 +176,13 @@ func findSessionFiles() ([]SessionFile, error) {
 // --- Parsing ---
 
 type ToolCall struct {
-	ToolName     string
-	InputSummary string
-	OutputBytes  int
-	Timestamp    time.Time
-	IsAgent      bool
-	AgentTokens  int
+	ToolName        string
+	InputSummary    string
+	OutputBytes     int
+	Timestamp       time.Time
+	IsAgent         bool
+	AgentTokens     int
+	NeedsPermission bool
 }
 
 type SessionReport struct {
@@ -253,7 +264,52 @@ func truncate(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
-func parseSession(path string) (*SessionReport, error) {
+// permKey returns the map key used to correlate permissions with tool calls.
+func permKey(toolName, inputSummary string) string {
+	return toolName + ":" + inputSummary
+}
+
+// loadPermissions reads the permissions JSONL file and returns a nested map:
+// session_id -> set of "toolName:inputSummary" keys.
+func loadPermissions() map[string]map[string]bool {
+	result := make(map[string]map[string]bool)
+
+	f, err := os.Open(permissionsFile())
+	if err != nil {
+		// File not existing is normal; other errors silently ignored
+		return result
+	}
+	defer f.Close()
+
+	type permEntry struct {
+		Ts   string `json:"ts"`
+		Sid  string `json:"sid"`
+		Tool string `json:"tool"`
+		Key  string `json:"key"`
+	}
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var pe permEntry
+		if err := json.Unmarshal(line, &pe); err != nil {
+			continue
+		}
+		if pe.Sid == "" || pe.Tool == "" {
+			continue
+		}
+		if result[pe.Sid] == nil {
+			result[pe.Sid] = make(map[string]bool)
+		}
+		result[pe.Sid][permKey(pe.Tool, pe.Key)] = true
+	}
+	return result
+}
+
+func parseSession(path string, perms map[string]map[string]bool) (*SessionReport, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -280,6 +336,8 @@ func parseSession(path string) (*SessionReport, error) {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024)
 
+	var sessionID string
+
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -289,6 +347,11 @@ func parseSession(path string) (*SessionReport, error) {
 		var entry Entry
 		if err := json.Unmarshal(line, &entry); err != nil {
 			continue
+		}
+
+		// Capture session ID from any entry
+		if entry.SessionID != "" && sessionID == "" {
+			sessionID = entry.SessionID
 		}
 
 		// Skip sidechain (subagent) entries — we only care about main context
@@ -325,6 +388,15 @@ func parseSession(path string) (*SessionReport, error) {
 					// OutputBytes not set for agents; IsAgent flag handles display
 				} else {
 					tc.OutputBytes = block.Content.Size()
+				}
+
+				// Check if this tool call required permission
+				if sessionID != "" && perms != nil {
+					if sessionPerms, ok := perms[sessionID]; ok {
+						if sessionPerms[permKey(call.name, call.summary)] {
+							tc.NeedsPermission = true
+						}
+					}
 				}
 
 				report.ToolCalls = append(report.ToolCalls, tc)
@@ -395,7 +467,11 @@ func printReport(r *SessionReport, sessionNum int) (bool, error) {
 			return false, err
 		}
 		for _, tc := range lspCalls {
-			if _, err := fmt.Fprintf(w, "    %s\n", tc.InputSummary); err != nil {
+			perm := ""
+			if tc.NeedsPermission {
+				perm = "[PERM] "
+			}
+			if _, err := fmt.Fprintf(w, "    %s%s\n", perm, tc.InputSummary); err != nil {
 				return false, err
 			}
 		}
@@ -406,11 +482,15 @@ func printReport(r *SessionReport, sessionNum int) (bool, error) {
 			return false, err
 		}
 		for _, tc := range bigOutputCalls {
+			perm := ""
+			if tc.NeedsPermission {
+				perm = "[PERM] "
+			}
 			var err error
 			if tc.IsAgent {
-				_, err = fmt.Fprintf(w, "    Agent(%d tokens): %s\n", tc.AgentTokens, tc.InputSummary)
+				_, err = fmt.Fprintf(w, "    %sAgent(%d tokens): %s\n", perm, tc.AgentTokens, tc.InputSummary)
 			} else {
-				_, err = fmt.Fprintf(w, "    %s(%s): %s\n", tc.ToolName, formatBytes(tc.OutputBytes), tc.InputSummary)
+				_, err = fmt.Fprintf(w, "    %s%s(%s): %s\n", perm, tc.ToolName, formatBytes(tc.OutputBytes), tc.InputSummary)
 			}
 			if err != nil {
 				return false, err
@@ -430,8 +510,10 @@ func formatBytes(n int) string {
 	return fmt.Sprintf("%.1fMB", float64(n)/1024/1024)
 }
 
-func main() {
-	signal.Ignore(syscall.SIGPIPE)
+// --- Subcommands ---
+
+func runWatch() {
+	perms := loadPermissions()
 
 	files, err := findSessionFiles()
 	if err != nil {
@@ -446,7 +528,7 @@ func main() {
 
 	displayNum := 0
 	for _, sf := range files {
-		report, err := parseSession(sf.Path)
+		report, err := parseSession(sf.Path, perms)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not parse %s: %v\n", sf.Path, err)
 			continue
@@ -463,5 +545,292 @@ func main() {
 			fmt.Fprintf(os.Stderr, "write error: %v\n", err)
 			return
 		}
+	}
+}
+
+func runRecordPermission() {
+	// Always exit 0 — must never disrupt Claude
+	defer os.Exit(0)
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return
+	}
+
+	var input struct {
+		SessionID string          `json:"session_id"`
+		ToolName  string          `json:"tool_name"`
+		ToolInput json.RawMessage `json:"tool_input"`
+	}
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return
+	}
+	if input.SessionID == "" || input.ToolName == "" {
+		return
+	}
+
+	key := summarizeInput(input.ToolName, input.ToolInput)
+
+	type permEntry struct {
+		Ts   string `json:"ts"`
+		Sid  string `json:"sid"`
+		Tool string `json:"tool"`
+		Key  string `json:"key"`
+	}
+	pe := permEntry{
+		Ts:   time.Now().UTC().Format(time.RFC3339),
+		Sid:  input.SessionID,
+		Tool: input.ToolName,
+		Key:  key,
+	}
+
+	line, err := json.Marshal(pe)
+	if err != nil {
+		return
+	}
+
+	dir := filepath.Join(home, ".claude", "claude_log")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+
+	fp := filepath.Join(dir, "permissions.jsonl")
+	f, err := os.OpenFile(fp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	f.Write(line)
+	f.WriteString("\n")
+}
+
+func runInstallHook() error {
+	execPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("get executable path: %w", err)
+	}
+	execPath, err = filepath.Abs(execPath)
+	if err != nil {
+		return fmt.Errorf("resolve absolute path: %w", err)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("get home dir: %w", err)
+	}
+
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+
+	var settings map[string]any
+	data, err := os.ReadFile(settingsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read settings: %w", err)
+	}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &settings); err != nil {
+			return fmt.Errorf("parse settings.json: %w", err)
+		}
+	}
+	if settings == nil {
+		settings = map[string]any{}
+	}
+
+	hookCmd := execPath + " record-permission"
+
+	hookEntry := map[string]any{
+		"hooks": []any{
+			map[string]any{
+				"type":    "command",
+				"command": hookCmd,
+			},
+		},
+	}
+
+	hooks, _ := settings["hooks"].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+	}
+
+	existing, _ := hooks["PermissionRequest"].([]any)
+	// Check if our hook is already present
+	for _, entry := range existing {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		innerHooks, _ := m["hooks"].([]any)
+		for _, ih := range innerHooks {
+			ihm, ok := ih.(map[string]any)
+			if !ok {
+				continue
+			}
+			if ihm["command"] == hookCmd {
+				fmt.Println("claude_log: hook already configured in ~/.claude/settings.json")
+				return nil
+			}
+		}
+	}
+
+	hooks["PermissionRequest"] = append(existing, hookEntry)
+	settings["hooks"] = hooks
+
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
+		return fmt.Errorf("create .claude dir: %w", err)
+	}
+	if err := os.WriteFile(settingsPath, append(out, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write settings.json: %w", err)
+	}
+
+	fmt.Printf("claude_log: hook installed — %s\n", hookCmd)
+	fmt.Println("claude_log: PermissionRequest hook added to ~/.claude/settings.json")
+	return nil
+}
+
+func runUninstallHook() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("get home dir: %w", err)
+	}
+
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+
+	data, err := os.ReadFile(settingsPath)
+	if os.IsNotExist(err) {
+		fmt.Println("claude_log: no ~/.claude/settings.json found — nothing to remove")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read settings: %w", err)
+	}
+
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return fmt.Errorf("parse settings.json: %w", err)
+	}
+
+	hooks, _ := settings["hooks"].(map[string]any)
+	if hooks == nil {
+		fmt.Println("claude_log: no hooks found in ~/.claude/settings.json — nothing to remove")
+		return nil
+	}
+
+	existing, _ := hooks["PermissionRequest"].([]any)
+	if len(existing) == 0 {
+		fmt.Println("claude_log: no PermissionRequest hooks found — nothing to remove")
+		return nil
+	}
+
+	var kept []any
+	removed := 0
+	for _, entry := range existing {
+		m, ok := entry.(map[string]any)
+		if !ok {
+			kept = append(kept, entry)
+			continue
+		}
+		innerHooks, _ := m["hooks"].([]any)
+		isMine := false
+		for _, ih := range innerHooks {
+			ihm, ok := ih.(map[string]any)
+			if !ok {
+				continue
+			}
+			cmd, _ := ihm["command"].(string)
+			if strings.HasSuffix(cmd, " record-permission") {
+				isMine = true
+				break
+			}
+		}
+		if isMine {
+			removed++
+		} else {
+			kept = append(kept, entry)
+		}
+	}
+
+	if removed == 0 {
+		fmt.Println("claude_log: no claude_log hook entries found — nothing to remove")
+		return nil
+	}
+
+	if len(kept) == 0 {
+		delete(hooks, "PermissionRequest")
+	} else {
+		hooks["PermissionRequest"] = kept
+	}
+	if len(hooks) == 0 {
+		delete(settings, "hooks")
+	} else {
+		settings["hooks"] = hooks
+	}
+
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+	if err := os.WriteFile(settingsPath, append(out, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write settings.json: %w", err)
+	}
+
+	fmt.Printf("claude_log: removed %d hook entry(s) from ~/.claude/settings.json\n", removed)
+	return nil
+}
+
+func printHelp() {
+	fmt.Print(`claude_log - Claude Code session log analyzer
+
+Usage: claude_log <command>
+
+Commands:
+  watch              Show session reports with tool call details
+  install-hook       Register the PermissionRequest hook in ~/.claude/settings.json
+  uninstall-hook     Remove the PermissionRequest hook from ~/.claude/settings.json
+  record-permission  (internal) Record a permission event from a hook invocation
+
+Options:
+  -h, --help         Show this help message
+`)
+}
+
+func main() {
+	signal.Ignore(syscall.SIGPIPE)
+
+	if len(os.Args) < 2 {
+		printHelp()
+		return
+	}
+
+	switch os.Args[1] {
+	case "watch":
+		runWatch()
+	case "record-permission":
+		runRecordPermission()
+	case "install-hook":
+		if err := runInstallHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "claude_log install-hook: %v\n", err)
+			os.Exit(1)
+		}
+	case "uninstall-hook":
+		if err := runUninstallHook(); err != nil {
+			fmt.Fprintf(os.Stderr, "claude_log uninstall-hook: %v\n", err)
+			os.Exit(1)
+		}
+	case "-h", "--help":
+		printHelp()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
+		printHelp()
+		os.Exit(1)
 	}
 }

@@ -65,14 +65,7 @@ Initial user turn (no tool results):
 }
 ```
 
-**`permissionMode`** values observed:
-- `"default"` — no special approval required
-- `"acceptEdits"` — user approved file edits
-- `"plan"` — user approved a plan
-- `"bypassPermissions"` — documented but not observed in practice
-- `"dontAsk"` — documented but not observed in practice
-
-The mode can change mid-session as the user grants approvals. It applies to all tool calls made in Claude's response to that user turn.
+`permissionMode` is present on user entries but does not reliably indicate whether a permission prompt was shown for any given tool call. Do not use it for permission detection.
 
 ## Tool result messages (user type)
 
