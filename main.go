@@ -428,6 +428,7 @@ func parseSession(path string, perms map[string]map[string]bool) (*SessionReport
 func printReport(r *SessionReport, sessionNum int) (bool, error) {
 	lspCalls := []ToolCall{}
 	bigOutputCalls := []ToolCall{}
+	permOnlyCalls := []ToolCall{} // permission-required calls not already in other sections
 
 	for _, tc := range r.ToolCalls {
 		if tc.ToolName == "LSP" {
@@ -435,10 +436,12 @@ func printReport(r *SessionReport, sessionNum int) (bool, error) {
 		}
 		if tc.IsAgent || tc.OutputBytes > 1000 {
 			bigOutputCalls = append(bigOutputCalls, tc)
+		} else if tc.NeedsPermission && tc.ToolName != "LSP" {
+			permOnlyCalls = append(permOnlyCalls, tc)
 		}
 	}
 
-	if len(lspCalls) == 0 && len(bigOutputCalls) == 0 {
+	if len(lspCalls) == 0 && len(bigOutputCalls) == 0 && len(permOnlyCalls) == 0 {
 		return false, nil
 	}
 
@@ -493,6 +496,17 @@ func printReport(r *SessionReport, sessionNum int) (bool, error) {
 				_, err = fmt.Fprintf(w, "    %s%s(%s): %s\n", perm, tc.ToolName, formatBytes(tc.OutputBytes), tc.InputSummary)
 			}
 			if err != nil {
+				return false, err
+			}
+		}
+	}
+
+	if len(permOnlyCalls) > 0 {
+		if _, err := fmt.Fprintln(w, "\n  Permission-required calls:"); err != nil {
+			return false, err
+		}
+		for _, tc := range permOnlyCalls {
+			if _, err := fmt.Fprintf(w, "    [PERM] %s(%s): %s\n", tc.ToolName, formatBytes(tc.OutputBytes), tc.InputSummary); err != nil {
 				return false, err
 			}
 		}
