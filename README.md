@@ -22,6 +22,13 @@ go install .
 
 This builds and places the binary in `$GOBIN` (default: `~/go/bin`). Make sure that directory is on your `PATH`.
 
+Or build manually and place wherever you like:
+
+```
+go build -o claude-log .
+mv claude-log /usr/local/bin/
+```
+
 ## Usage
 
 ```
