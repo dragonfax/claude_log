@@ -428,7 +428,7 @@ func parseSession(path string, perms map[string]map[string]bool) (*SessionReport
 func printReport(r *SessionReport, sessionNum int) (bool, error) {
 	lspCalls := []ToolCall{}
 	bigOutputCalls := []ToolCall{}
-	permOnlyCalls := []ToolCall{} // permission-required calls not already in other sections
+	permCalls := []ToolCall{} // all permission-required calls (may overlap with bigOutputCalls)
 
 	for _, tc := range r.ToolCalls {
 		if tc.ToolName == "LSP" {
@@ -436,12 +436,13 @@ func printReport(r *SessionReport, sessionNum int) (bool, error) {
 		}
 		if tc.IsAgent || tc.OutputBytes > 1000 {
 			bigOutputCalls = append(bigOutputCalls, tc)
-		} else if tc.NeedsPermission && tc.ToolName != "LSP" {
-			permOnlyCalls = append(permOnlyCalls, tc)
+		}
+		if tc.NeedsPermission && tc.ToolName != "LSP" {
+			permCalls = append(permCalls, tc)
 		}
 	}
 
-	if len(lspCalls) == 0 && len(bigOutputCalls) == 0 && len(permOnlyCalls) == 0 {
+	if len(lspCalls) == 0 && len(bigOutputCalls) == 0 && len(permCalls) == 0 {
 		return false, nil
 	}
 
@@ -470,11 +471,7 @@ func printReport(r *SessionReport, sessionNum int) (bool, error) {
 			return false, err
 		}
 		for _, tc := range lspCalls {
-			perm := ""
-			if tc.NeedsPermission {
-				perm = "[PERM] "
-			}
-			if _, err := fmt.Fprintf(w, "    %s%s\n", perm, tc.InputSummary); err != nil {
+			if _, err := fmt.Fprintf(w, "    %s\n", tc.InputSummary); err != nil {
 				return false, err
 			}
 		}
@@ -485,15 +482,11 @@ func printReport(r *SessionReport, sessionNum int) (bool, error) {
 			return false, err
 		}
 		for _, tc := range bigOutputCalls {
-			perm := ""
-			if tc.NeedsPermission {
-				perm = "[PERM] "
-			}
 			var err error
 			if tc.IsAgent {
-				_, err = fmt.Fprintf(w, "    %sAgent(%d tokens): %s\n", perm, tc.AgentTokens, tc.InputSummary)
+				_, err = fmt.Fprintf(w, "    Agent(%d tokens): %s\n", tc.AgentTokens, tc.InputSummary)
 			} else {
-				_, err = fmt.Fprintf(w, "    %s%s(%s): %s\n", perm, tc.ToolName, formatBytes(tc.OutputBytes), tc.InputSummary)
+				_, err = fmt.Fprintf(w, "    %s(%s): %s\n", tc.ToolName, formatBytes(tc.OutputBytes), tc.InputSummary)
 			}
 			if err != nil {
 				return false, err
@@ -501,11 +494,11 @@ func printReport(r *SessionReport, sessionNum int) (bool, error) {
 		}
 	}
 
-	if len(permOnlyCalls) > 0 {
+	if len(permCalls) > 0 {
 		if _, err := fmt.Fprintln(w, "\n  Permission-required calls:"); err != nil {
 			return false, err
 		}
-		for _, tc := range permOnlyCalls {
+		for _, tc := range permCalls {
 			if _, err := fmt.Fprintf(w, "    [PERM] %s(%s): %s\n", tc.ToolName, formatBytes(tc.OutputBytes), tc.InputSummary); err != nil {
 				return false, err
 			}
