@@ -36,7 +36,6 @@ type Entry struct {
 	IsSidechain bool           `json:"isSidechain"`
 	Message    *Message        `json:"message"`
 	ToolUseResult *ToolUseResult `json:"toolUseResult"`
-	PermissionMode string      `json:"permissionMode"`
 }
 
 type Message struct {
@@ -167,13 +166,12 @@ func findSessionFiles() ([]SessionFile, error) {
 // --- Parsing ---
 
 type ToolCall struct {
-	ToolName       string
-	InputSummary   string
-	OutputBytes    int
-	NeedsPermission bool // true when the session's permissionMode != "default" at time of call
-	Timestamp      time.Time
-	IsAgent        bool
-	AgentTokens    int
+	ToolName     string
+	InputSummary string
+	OutputBytes  int
+	Timestamp    time.Time
+	IsAgent      bool
+	AgentTokens  int
 }
 
 type SessionReport struct {
@@ -193,6 +191,15 @@ func summarizeInput(name string, raw json.RawMessage) string {
 	}
 
 	switch name {
+	case "LSP":
+		op, _ := m["operation"].(string)
+		fp, _ := m["filePath"].(string)
+		if op != "" && fp != "" {
+			return truncate(fmt.Sprintf("%s %s", op, fp), maxSummary)
+		}
+		if op != "" {
+			return op
+		}
 	case "Bash":
 		if cmd, ok := m["command"].(string); ok {
 			cmd = strings.ReplaceAll(cmd, "\n", " ")
@@ -270,9 +277,6 @@ func parseSession(path string) (*SessionReport, error) {
 		isAgent bool
 	}
 	pending := map[string]pendingCall{} // tool_use_id -> call info
-	// Track permissionMode from the most recent user message (initial message only)
-	currentPermMode := "default"
-
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024)
 
@@ -297,10 +301,6 @@ func parseSession(path string) (*SessionReport, error) {
 			if entry.Message == nil {
 				continue
 			}
-			// Capture permission mode from initial user messages (no tool results)
-			if entry.PermissionMode != "" {
-				currentPermMode = entry.PermissionMode
-			}
 
 			// Process tool results
 			for _, block := range entry.Message.Content.Blocks {
@@ -318,7 +318,6 @@ func parseSession(path string) (*SessionReport, error) {
 					InputSummary: call.summary,
 					Timestamp:    call.ts,
 					IsAgent:      call.isAgent,
-					NeedsPermission: currentPermMode != "default",
 				}
 
 				if call.isAgent && entry.ToolUseResult != nil {
@@ -355,19 +354,19 @@ func parseSession(path string) (*SessionReport, error) {
 // --- Display ---
 
 func printReport(r *SessionReport, sessionNum int) (bool, error) {
-	bashCalls := []ToolCall{}
+	lspCalls := []ToolCall{}
 	bigOutputCalls := []ToolCall{}
 
 	for _, tc := range r.ToolCalls {
-		if tc.ToolName == "Bash" {
-			bashCalls = append(bashCalls, tc)
+		if tc.ToolName == "LSP" {
+			lspCalls = append(lspCalls, tc)
 		}
 		if tc.IsAgent || tc.OutputBytes > 1000 {
 			bigOutputCalls = append(bigOutputCalls, tc)
 		}
 	}
 
-	if len(bashCalls) == 0 && len(bigOutputCalls) == 0 {
+	if len(lspCalls) == 0 && len(bigOutputCalls) == 0 {
 		return false, nil
 	}
 
@@ -391,16 +390,12 @@ func printReport(r *SessionReport, sessionNum int) (bool, error) {
 		return false, err
 	}
 
-	if len(bashCalls) > 0 {
-		if _, err := fmt.Fprintln(w, "\n  Bash commands:"); err != nil {
+	if len(lspCalls) > 0 {
+		if _, err := fmt.Fprintln(w, "\n  LSP calls:"); err != nil {
 			return false, err
 		}
-		for _, tc := range bashCalls {
-			perm := ""
-			if tc.NeedsPermission {
-				perm = " [PERMISSION REQUIRED]"
-			}
-			if _, err := fmt.Fprintf(w, "    %s$ %s\n", perm, tc.InputSummary); err != nil {
+		for _, tc := range lspCalls {
+			if _, err := fmt.Fprintf(w, "    %s\n", tc.InputSummary); err != nil {
 				return false, err
 			}
 		}
