@@ -16,12 +16,11 @@ Only main-context activity is reported. Tool calls made inside subagents are exc
 
 ## Install
 
-Build a binary and put it on your PATH:
+```
+go install .
+```
 
-```
-go build -o claude-log .
-mv claude-log /usr/local/bin/
-```
+This builds and places the binary in `$GOBIN` (default: `~/go/bin`). Make sure that directory is on your `PATH`.
 
 ## Usage
 
